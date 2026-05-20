@@ -162,6 +162,9 @@ def query_maf_file_ids(cancer_type: str, limit_files: int) -> list:
                                      "value": "Masked Somatic Mutation"}},
             {"op": "=", "content": {"field": "data_format",
                                      "value": "MAF"}},
+            # Use current GDC workflow; MuTect2/MuSE-only workflows are deprecated
+            {"op": "=", "content": {"field": "analysis.workflow_type",
+                                     "value": "Aliquot Ensemble Somatic Variant Merging and Masking"}},
             {"op": "=", "content": {"field": "access",
                                      "value": "open"}},
         ]
@@ -242,16 +245,42 @@ def download_maf(file_id: str, cache_dir: str) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────────────────
 #  Ensembl — Fetch DNA sequence for a genomic region
 # ─────────────────────────────────────────────────────────────────────────────
+_ENSEMBL_LAST_CALL: float = 0.0
+_ENSEMBL_MIN_INTERVAL: float = 1.0 / 13.0   # 13 req/sec — Ensembl hard cap is 15
+
+
 def fetch_sequence_ensembl(chrom: str, start: int, end: int,
                            window: int = 256) -> str | None:
-    region = f"{chrom}:{max(1, start - window)}..{end + window}"
-    url = f"{ENSEMBL}/sequence/region/human/{region}"
-    try:
-        resp = requests.get(url, headers={"Content-Type": "text/plain"}, timeout=15)
+    global _ENSEMBL_LAST_CALL
+    # Exact 512 bp window anchored at Start_Position (matches new pipeline spec)
+    fetch_start = max(1, start - 255)
+    fetch_end   = start + 256
+    region = f"{chrom}:{fetch_start}..{fetch_end}"
+    url    = f"{ENSEMBL}/sequence/region/human/{region}"
+
+    # Honour Ensembl rate limit
+    dt = time.time() - _ENSEMBL_LAST_CALL
+    if dt < _ENSEMBL_MIN_INTERVAL:
+        time.sleep(_ENSEMBL_MIN_INTERVAL - dt)
+    _ENSEMBL_LAST_CALL = time.time()
+
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    for attempt in range(4):
+        try:
+            resp = requests.get(url, headers=headers, timeout=20)
+        except Exception:
+            time.sleep(2 ** attempt)
+            continue
         if resp.status_code == 200:
-            return "".join(c for c in resp.text.strip().upper() if c in "ATGCN")
-    except Exception:
-        pass
+            seq = resp.json().get("seq", "")
+            return "".join(c for c in seq.upper() if c in "ATGCN") or None
+        if resp.status_code == 429:
+            retry_after = float(resp.headers.get("Retry-After", 2 ** attempt))
+            time.sleep(retry_after)
+            continue
+        if resp.status_code in (400, 404):
+            return None
+        time.sleep(2 ** attempt)
     return None
 
 
@@ -339,8 +368,7 @@ def build_dataset(cancer_types: list, seq_len: int,
                 chrom = str(row["Chromosome"]).replace("chr", "")
                 start = int(row["Start_Position"])
                 end   = int(row["End_Position"])
-                seq   = fetch_sequence_ensembl(chrom, start, end,
-                                               window=seq_len // 2)
+                seq = fetch_sequence_ensembl(chrom, start, end)
                 if seq and len(seq) >= 50:
                     cancer_seqs.append(seq[:seq_len].ljust(seq_len, "N"))
                 time.sleep(0.1)
