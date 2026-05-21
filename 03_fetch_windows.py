@@ -29,6 +29,7 @@ from pathlib import Path
 
 import pandas as pd
 import requests
+from tqdm import tqdm
 
 ENSEMBL = "https://rest.ensembl.org"
 HEADERS = {"Accept": "application/json", "User-Agent": "tcga-window-fetcher/1.0"}
@@ -114,8 +115,10 @@ def run(variants_tsv: Path, out_jsonl: Path) -> None:
     out_jsonl.parent.mkdir(parents=True, exist_ok=True)
 
     with gzip.open(out_jsonl, "at") as out:
+        pbar = tqdm(total=len(todo), unit="var", desc=variants_tsv.stem[:20],
+                    dynamic_ncols=False, ascii=True, file=sys.stdout,
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
         for i, row in todo.iterrows():
-            # Pace to TARGET_RPS
             dt = time.monotonic() - last
             if dt < MIN_INTERVAL:
                 time.sleep(MIN_INTERVAL - dt)
@@ -126,14 +129,12 @@ def run(variants_tsv: Path, out_jsonl: Path) -> None:
                 seq = fetch_one(session, chrom, int(row["start"]))
             except Exception as ex:
                 seq = None
-                print(f"  hard fail {row['variant_id']}: {ex}", file=sys.stderr)
+                tqdm.write(f"  hard fail {row['variant_id']}: {ex}")
 
+            pbar.update(1)
             if seq is None or len(seq) != WINDOW:
-                # Either fetch failed, or near telomere -> length < 512.
-                # Skip rather than pad (caller's choice; spec said 'exactly 512').
                 n_fail += 1
-                if (n_fail % 100) == 0:
-                    print(f"  fails so far: {n_fail}", file=sys.stderr)
+                pbar.set_postfix(ok=n_ok, fail=n_fail, refresh=False)
                 continue
 
             rec = {
@@ -151,11 +152,12 @@ def run(variants_tsv: Path, out_jsonl: Path) -> None:
             }
             out.write(json.dumps(rec) + "\n")
             n_ok += 1
+            pbar.set_postfix(ok=n_ok, fail=n_fail, refresh=False)
 
             if (n_ok % 500) == 0:
                 out.flush()
-                print(f"  progress: ok={n_ok:,} fail={n_fail:,} "
-                      f"({n_ok / max(1, n_ok + n_fail):.1%})", flush=True)
+
+        pbar.close()
 
     print(f"[{variants_tsv.name}] DONE  ok={n_ok:,}  fail={n_fail:,}", flush=True)
 

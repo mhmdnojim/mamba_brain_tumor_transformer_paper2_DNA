@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pandas as pd
 import requests
+from tqdm import tqdm
 
 ENSEMBL = "https://rest.ensembl.org"
 HEADERS = {"Accept": "application/json", "User-Agent": "tcga-window-fetcher/1.0"}
@@ -197,6 +198,9 @@ def main() -> int:
     n_ok = n_fail = 0
 
     with gzip.open(out_path, "at") as out:
+        pbar = tqdm(total=needed, unit="seq", desc="negatives",
+                    dynamic_ncols=False, ascii=True, file=sys.stdout,
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
         for chrom, pos in candidates:
             if n_ok >= needed:
                 break
@@ -214,6 +218,7 @@ def main() -> int:
             seq = fetch_one(session, ens_chrom, pos)
             if seq is None or len(seq) != WINDOW:
                 n_fail += 1
+                pbar.set_postfix(fail=n_fail, refresh=False)
                 continue
 
             rec = {
@@ -231,10 +236,13 @@ def main() -> int:
             }
             out.write(json.dumps(rec) + "\n")
             n_ok += 1
+            pbar.update(1)
+            pbar.set_postfix(fail=n_fail, refresh=False)
 
             if (n_ok % 200) == 0:
                 out.flush()
-                print(f"  negatives: ok={n_ok:,}  fail={n_fail:,}", flush=True)
+
+        pbar.close()
 
     print(f"DONE  ok={n_ok:,}  fail={n_fail:,}", flush=True)
     return 0
