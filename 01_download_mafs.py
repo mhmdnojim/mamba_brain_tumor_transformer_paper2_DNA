@@ -53,6 +53,9 @@ def list_files(project: str) -> list[dict]:
     return r.json()["data"]["hits"]
 
 
+BATCH_SIZE = 200  # GDC API rejects very large bundles with 500; keep chunks small
+
+
 def download_bundle(file_ids: list[str], dest_dir: Path) -> None:
     dest_dir.mkdir(parents=True, exist_ok=True)
     payload = json.dumps({"ids": file_ids})
@@ -67,9 +70,8 @@ def download_bundle(file_ids: list[str], dest_dir: Path) -> None:
     # If multi-file: server returns a gzipped tarball.
     if "tar" in ctype or "tar" in cdisp:
         with tarfile.open(fileobj=BytesIO(body), mode="r:gz") as tf:
-            tf.extractall(dest_dir)
+            tf.extractall(dest_dir, filter="data")
     else:
-        # Single file path. Pull filename from header if present.
         m = re.search(r'filename="?([^";]+)"?', cdisp)
         name = m.group(1) if m else f"{file_ids[0]}.maf.gz"
         (dest_dir / name).write_bytes(body)
@@ -84,9 +86,30 @@ def main() -> int:
             return 1
         print(f"[{project}] {len(hits)} file(s) matched; total size "
               f"{sum(h['file_size'] for h in hits) / 1e6:.1f} MB", flush=True)
+
+        dest_dir = OUT_ROOT / project
         ids = [h["file_id"] for h in hits]
-        download_bundle(ids, OUT_ROOT / project)
-        print(f"[{project}] downloaded to {OUT_ROOT / project}", flush=True)
+
+        # Skip files already downloaded
+        already = {f.name for f in dest_dir.glob("*.maf.gz")} if dest_dir.exists() else set()
+        id_to_name = {h["file_id"]: h["file_name"] for h in hits}
+        remaining = [fid for fid in ids if id_to_name[fid] not in already]
+
+        if not remaining:
+            print(f"[{project}] all files already downloaded — skipping", flush=True)
+            continue
+
+        print(f"[{project}] {len(already)} already done, {len(remaining)} to download", flush=True)
+
+        # Batch downloads to avoid GDC 500 errors on large payloads
+        for i in range(0, len(remaining), BATCH_SIZE):
+            batch = remaining[i:i + BATCH_SIZE]
+            print(f"[{project}] batch {i // BATCH_SIZE + 1}/"
+                  f"{(len(remaining) - 1) // BATCH_SIZE + 1} "
+                  f"({len(batch)} files) ...", flush=True)
+            download_bundle(batch, dest_dir)
+
+        print(f"[{project}] downloaded to {dest_dir}", flush=True)
     return 0
 
 
