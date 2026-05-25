@@ -496,15 +496,25 @@ def load_done(out_path: Path) -> set[str]:
         print(f"  Output file is empty (previous run crashed) — starting fresh.")
         out_path.unlink()
         return done
+    n_lines = 0
     try:
         with gzip.open(out_path, "rt") as f:
             for line in f:
+                n_lines += 1
                 try:
                     done.add(json.loads(line)["paired_positive_id"])
                 except Exception:
                     continue
     except (OSError, EOFError):
         print(f"  Output file is corrupt (previous run crashed) — starting fresh.")
+        out_path.unlink()
+        return set()
+    if n_lines == 0:
+        print("  Output gzip contains no records — starting fresh.")
+        out_path.unlink()
+        return set()
+    if not done:
+        print("  Output gzip has no valid matched records — starting fresh.")
         out_path.unlink()
         return set()
     return done
@@ -569,7 +579,8 @@ def match_negatives(
 
     cursors: dict[str, int] = defaultdict(int)
 
-    with gzip.open(out_path, "wt") as out, \
+    out_mode = "at" if done else "wt"
+    with gzip.open(out_path, out_mode) as out, \
          tqdm(total=len(remaining), desc="  Matching negatives",
               unit="seq", ascii=True, ncols=80, file=sys.stdout) as pbar:
 
@@ -780,6 +791,13 @@ def main(gc_tol: float = 0.02,
         n = sum(1 for _ in gzip.open(out_path, "rt"))
         mb = out_path.stat().st_size / 1e6
         print(f"  {out_path}  ({n:,} records, {mb:.1f} MB)")
+        if n == 0:
+            print("  ERROR: matched-negative generation produced zero records.",
+                  file=sys.stderr)
+            print("  Try rerunning with --no_region, a larger --oversample, "
+                  "a larger --max_tries, or a looser --gc_tol.", file=sys.stderr)
+            out_path.unlink()
+            return 1
         coverage = 100 * n / max(1, len(positives))
         print(f"  Coverage: {coverage:.1f}% of positives matched")
         print(f"\nNext step:")

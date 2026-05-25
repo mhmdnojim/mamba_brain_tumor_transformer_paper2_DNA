@@ -84,8 +84,10 @@ def main(out_csv: str = "cancer_genes.csv", gc_matched: bool = False,
                     continue
 
     if n_normal == 0:
-        print("WARNING: No normal sequences (label=0) found. "
-              "Run stage 4 (04_generate_negatives.py) first.", file=sys.stderr)
+        print("ERROR: No normal sequences (label=0) found. "
+              "Run stage 4/4c and make sure the negatives JSONL has records.",
+              file=sys.stderr)
+        return 1
 
     # Shuffle before writing so train/val/test splits are random
     random.seed(42)
