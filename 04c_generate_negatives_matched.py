@@ -642,9 +642,6 @@ def match_negatives(
                 pbar.set_postfix(ok=n_ok, fail=n_fail,
                                  no_cand=n_no_candidate, refresh=False)
 
-    if n_ok + n_no_candidate > 0:
-        out.flush() if hasattr(out, "flush") else None
-
     print(f"\n  DONE  matched={n_ok:,}  fetch_fail={n_fail:,}  "
           f"no_candidate={n_no_candidate:,}")
     if n_no_candidate > 0:
