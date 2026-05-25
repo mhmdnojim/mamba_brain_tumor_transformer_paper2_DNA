@@ -569,7 +569,7 @@ def match_negatives(
 
     cursors: dict[str, int] = defaultdict(int)
 
-    with gzip.open(out_path, "at") as out, \
+    with gzip.open(out_path, "wt") as out, \
          tqdm(total=len(remaining), desc="  Matching negatives",
               unit="seq", ascii=True, ncols=80, file=sys.stdout) as pbar:
 
