@@ -492,12 +492,21 @@ def load_done(out_path: Path) -> set[str]:
     done: set[str] = set()
     if not out_path.exists():
         return done
-    with gzip.open(out_path, "rt") as f:
-        for line in f:
-            try:
-                done.add(json.loads(line)["paired_positive_id"])
-            except Exception:
-                continue
+    if out_path.stat().st_size == 0:
+        print(f"  Output file is empty (previous run crashed) — starting fresh.")
+        out_path.unlink()
+        return done
+    try:
+        with gzip.open(out_path, "rt") as f:
+            for line in f:
+                try:
+                    done.add(json.loads(line)["paired_positive_id"])
+                except Exception:
+                    continue
+    except (OSError, EOFError):
+        print(f"  Output file is corrupt (previous run crashed) — starting fresh.")
+        out_path.unlink()
+        return set()
     return done
 
 
