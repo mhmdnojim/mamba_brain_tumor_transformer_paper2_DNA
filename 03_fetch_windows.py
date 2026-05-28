@@ -87,14 +87,22 @@ def fetch_one(session: requests.Session, chrom: str, start: int) -> str | None:
 def load_done(path: Path) -> set[str]:
     if not path.exists():
         return set()
+    if path.stat().st_size == 0:
+        path.unlink()
+        return set()
     done = set()
-    with gzip.open(path, "rt") as f:
-        for line in f:
-            try:
-                rec = json.loads(line)
-                done.add(rec["variant_id"])
-            except Exception:
-                continue
+    try:
+        with gzip.open(path, "rt") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                    done.add(rec["variant_id"])
+                except Exception:
+                    continue
+    except (EOFError, OSError):
+        # File was truncated mid-write (session crash). Keep valid records found so far.
+        print(f"  WARNING: {path.name} is incomplete (session crash). "
+              f"Recovered {len(done):,} records — will re-fetch the rest.")
     return done
 
 
