@@ -52,6 +52,11 @@ def main(projects: list[str]) -> int:
     out.mkdir(exist_ok=True)
 
     for project in projects:
+        out_path = out / f"{project}_variants.tsv.gz"
+        if out_path.exists():
+            print(f"[{project}] {out_path} already exists — skipping")
+            continue
+
         proj_dir = root / project
         mafs = sorted(proj_dir.rglob("*.maf.gz"))
         if not mafs:
@@ -85,7 +90,6 @@ def main(projects: list[str]) -> int:
         canonical = {f"chr{i}" for i in range(1, 23)} | {"chrX", "chrY", "chrM"}
         df = df[df["chromosome"].isin(canonical)].reset_index(drop=True)
 
-        out_path = out / f"{project}_variants.tsv.gz"
         df.to_csv(out_path, sep="\t", index=False, compression="gzip")
         print(f"[{project}] {len(df):,} variants across {df['case_id'].nunique()} cases "
               f"-> {out_path}", flush=True)
