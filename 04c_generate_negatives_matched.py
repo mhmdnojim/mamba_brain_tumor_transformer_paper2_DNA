@@ -150,7 +150,9 @@ def fetch_seq_local(fasta, chrom: str, pos: int) -> str | None:
             key = chrom.removeprefix("chr")
         if key not in fasta:
             return None
-        seq = fasta[key][s - 1:e].seq   # pyfaidx is 0-based
+        sliced = fasta[key][s - 1:e]    # pyfaidx is 0-based
+        # as_raw=True returns a plain str; without it returns a Sequence with .seq
+        seq = sliced if isinstance(sliced, str) else sliced.seq
         return seq.upper() if len(seq) == WINDOW else None
     except Exception:
         return None
@@ -576,6 +578,24 @@ def match_negatives(
     n_ok = n_fail = n_no_candidate = 0
     path_label = "local FASTA" if use_local else "Ensembl REST"
     print(f"  Sequence source: {path_label}")
+
+    # Pre-flight: verify fetch_seq_local actually returns data before the full run.
+    # Catches as_raw=True str-vs-Sequence mismatch or wrong chrom keys in <1 second.
+    if use_local:
+        probe = None
+        for chrom, q in chrom_candidates.items():
+            if q:
+                probe = fetch_seq_local(fasta, chrom, q[0])
+                if probe is not None:
+                    break
+        if probe is None:
+            raise RuntimeError(
+                "Pre-flight FASTA fetch FAILED: fetch_seq_local returned None for "
+                "all probed candidates. Check: (1) chromosome-name mismatch between "
+                "FASTA and data (print fasta.keys()), (2) candidate positions out of "
+                "range. Aborting before wasting the full run."
+            )
+        print(f"  Pre-flight fetch OK (sample window {len(probe)} bp)")
 
     cursors: dict[str, int] = defaultdict(int)
 
