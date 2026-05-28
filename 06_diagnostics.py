@@ -42,6 +42,7 @@ import json
 import random
 import sys
 import time
+import zlib
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -72,12 +73,16 @@ CHROM_ORDER = [f"chr{i}" for i in range(1, 23)] + ["chrX", "chrY"]
 # ---------------------------------------------------------------------------
 def load_jsonl(path: Path) -> list[dict]:
     recs = []
-    with gzip.open(path, "rt") as f:
-        for line in f:
-            try:
-                recs.append(json.loads(line))
-            except Exception:
-                continue
+    try:
+        with gzip.open(path, "rt") as f:
+            for line in f:
+                try:
+                    recs.append(json.loads(line))
+                except Exception:
+                    continue
+    except (EOFError, OSError, zlib.error) as e:
+        print(f"  WARNING: {path.name} is corrupt ({type(e).__name__}) — "
+              f"recovered {len(recs):,} records before the corruption.")
     return recs
 
 
