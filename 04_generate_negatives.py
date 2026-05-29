@@ -112,23 +112,46 @@ def is_blocked(positions: list[int], pos: int) -> bool:
 def load_done(path: Path) -> set[str]:
     if not path.exists():
         return set()
+    if path.stat().st_size == 0:
+        path.unlink()
+        return set()
     done: set[str] = set()
-    with gzip.open(path, "rt") as f:
-        for line in f:
-            try:
-                done.add(json.loads(line)["variant_id"])
-            except Exception:
-                continue
+    try:
+        with gzip.open(path, "rt") as f:
+            for line in f:
+                try:
+                    done.add(json.loads(line)["variant_id"])
+                except Exception:
+                    continue
+    except (EOFError, OSError) as e:
+        print(f"  WARNING: {path.name} is corrupt ({type(e).__name__}) — "
+              f"recovered {len(done):,} records, re-fetching the rest.")
     return done
 
 
 def count_cancer_seqs(seq_dir: Path) -> int:
+    import zlib
     total = 0
     for p in seq_dir.glob("*_windows.jsonl.gz"):
         if "normals" in p.name:
             continue
-        with gzip.open(p, "rt") as f:
-            total += sum(1 for _ in f)
+        try:
+            with gzip.open(p, "rt") as f:
+                total += sum(1 for _ in f)
+        except (EOFError, OSError, zlib.error):
+            # Corrupt file — count valid lines only
+            n = 0
+            try:
+                with gzip.open(p, "rt") as f:
+                    for line in f:
+                        try:
+                            json.loads(line)
+                            n += 1
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            total += n
     return total
 
 
@@ -197,7 +220,8 @@ def main() -> int:
     last = 0.0
     n_ok = n_fail = 0
 
-    with gzip.open(out_path, "at") as out:
+    out_mode = "at" if done else "wt"
+    with gzip.open(out_path, out_mode) as out:
         pbar = tqdm(total=needed, unit="seq", desc="negatives",
                     dynamic_ncols=False, ascii=True, file=sys.stdout,
                     bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]")
