@@ -561,8 +561,19 @@ def match_negatives(
     for chrom in chrom_candidates:
         rng.shuffle(chrom_candidates[chrom])
 
-    # Resume
+    # Resume: load done IDs and raw lines — always rewrite in "wt" mode to avoid
+    # Python 3.12 gzip "at" mode silent data loss on append.
     done = load_done(out_path)
+    done_lines: list[str] = []
+    if done and out_path.exists():
+        try:
+            with gzip.open(out_path, "rt") as f:
+                for line in f:
+                    line = line.rstrip("\n")
+                    if line:
+                        done_lines.append(line)
+        except (EOFError, OSError):
+            pass
     print(f"  Already matched: {len(done):,} positives")
     remaining = [p for p in positives
                  if p.get("variant_id", "") not in done]
@@ -580,7 +591,6 @@ def match_negatives(
     print(f"  Sequence source: {path_label}")
 
     # Pre-flight: verify fetch_seq_local actually returns data before the full run.
-    # Catches as_raw=True str-vs-Sequence mismatch or wrong chrom keys in <1 second.
     if use_local:
         probe = None
         for chrom, q in chrom_candidates.items():
@@ -599,10 +609,15 @@ def match_negatives(
 
     cursors: dict[str, int] = defaultdict(int)
 
-    out_mode = "at" if done else "wt"
-    with gzip.open(out_path, out_mode) as out, \
+    # Always open in "wt" (overwrite) — copy done_lines back first, then append new.
+    with gzip.open(out_path, "wt") as out, \
          tqdm(total=len(remaining), desc="  Matching negatives",
               unit="seq", ascii=True, ncols=80, file=sys.stdout) as pbar:
+
+        # Write previously matched records back before processing new ones
+        for line in done_lines:
+            out.write(line + "\n")
+        n_ok = len(done_lines)
 
         for pos_rec in remaining:
             chrom      = norm_chrom(pos_rec["chromosome"])
