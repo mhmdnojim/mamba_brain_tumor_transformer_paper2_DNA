@@ -1,21 +1,29 @@
 """
-cnn_baseline.py — 1-D CNN baseline for cancer somatic-mutation context classification.
+cnn_baseline.py — Basset-style 1-D CNN baseline for cancer somatic-mutation classification.
 
-Same task, same splits, same metrics as train.py (Mamba), so the comparison is fair:
-  - Input  : 512 bp DNA sequence tokenized character-level (A/T/G/C/N → int)
-  - Output : Cancer (1) or Normal (0)
-  - Splits : chromosome-disjoint train/val/test from --splits_dir
+Architecture (Kelley et al. 2016, "Basset: learning the regulatory code of
+the accessible genome with deep convolutional neural networks"):
+  Input  : 512 bp DNA sequence, character-level tokenized (A/T/G/C/N → int ID)
+  Layer 1: Conv1d(embed, C1, k=19) + BN + ReLU + MaxPool(3)
+  Layer 2: Conv1d(C1, C2, k=11)    + BN + ReLU + MaxPool(4)
+  Layer 3: Conv1d(C2, C3, k=7)     + BN + ReLU + MaxPool(4)
+  FC1    : Linear(C3 * L', F1) + ReLU + Dropout(0.3)
+  FC2    : Linear(F1, F2)      + ReLU + Dropout(0.3)
+  Head   : Linear(F2, 2)
 
-Architecture  : Embedding → 4 × (Conv1d + BN + ReLU + MaxPool) → GlobalAvgPool → MLP
-Parameters    : ~3.8 M  (comparable to Mamba 3.51 M)
+Two sizes (--arch flag):
+  basset   : C=(300,200,200), FC=(1000,1000), ~4.1 M params  [original Basset scale]
+  matched  : C=(128,128,128), FC=(512, 512),  ~3.5 M params  [parameter-matched to Mamba]
+
+Same splits, tokenizer, metrics, and per-chromosome test eval as train.py (Mamba).
 
 Run:
-    python cnn_baseline.py
-    python cnn_baseline.py --max_steps 20000 --save_dir ./checkpoints_cnn
-    python cnn_baseline.py --resume ./checkpoints_cnn/step_5000.pt
+    python cnn_baseline.py --arch basset  --save_dir ./checkpoints_cnn_basset
+    python cnn_baseline.py --arch matched --save_dir ./checkpoints_cnn_matched
 """
 
 import os
+import math
 import time
 import argparse
 import csv
@@ -29,11 +37,11 @@ from sklearn.metrics import roc_auc_score
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  TOKENIZER  (identical to train.py — ensures same encoding)
+#  TOKENIZER  (identical to train.py)
 # ─────────────────────────────────────────────────────────────────────────────
 class DNATokenizer:
-    VOCAB = {"[PAD]": 0, "[UNK]": 1, "A": 2, "T": 3, "G": 4, "C": 5, "N": 6}
-    PAD_ID = 0
+    VOCAB    = {"[PAD]": 0, "[UNK]": 1, "A": 2, "T": 3, "G": 4, "C": 5, "N": 6}
+    PAD_ID   = 0
     vocab_size = len(VOCAB)
 
     def encode(self, sequence: str, max_len: int) -> list:
@@ -50,19 +58,16 @@ class CancerGeneDataset(Dataset):
     def __init__(self, csv_path: str, tokenizer: DNATokenizer, seq_len: int):
         self.tokenizer = tokenizer
         self.seq_len   = seq_len
-        self.sequences = []
-        self.labels    = []
+        self.sequences, self.labels = [], []
         with open(csv_path, newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
+            for row in csv.DictReader(f):
                 self.sequences.append(row["sequence"].strip().upper())
                 self.labels.append(int(row["label"]))
         cancer = sum(self.labels)
         print(f"  {os.path.basename(csv_path):14s}  n={len(self.sequences):>7,}  "
               f"cancer={cancer:>7,}  normal={len(self.labels)-cancer:>7,}")
 
-    def __len__(self):
-        return len(self.sequences)
+    def __len__(self): return len(self.sequences)
 
     def __getitem__(self, idx):
         ids   = torch.tensor(self.tokenizer.encode(self.sequences[idx], self.seq_len),
@@ -72,46 +77,62 @@ class CancerGeneDataset(Dataset):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  MODEL  — 1-D CNN
+#  MODEL — Basset-style 1-D CNN
 #
-#  Embedding(7, 128)
-#  → Conv1d(128→256, k=8) → BN → ReLU → MaxPool(2)     L: 512 → 256
-#  → Conv1d(256→512, k=8) → BN → ReLU → MaxPool(2)     L: 256 → 128
-#  → Conv1d(512→512, k=8) → BN → ReLU → MaxPool(2)     L: 128 → 64
-#  → Conv1d(512→256, k=4) → BN → ReLU → GlobalAvgPool  L: 64  → 1
-#  → Dropout(0.3) → Linear(256→128) → ReLU → Linear(128→2)
-#
-#  Total params ≈ 3.8 M  (vs Mamba 3.51 M — comparable scale)
+#  Pool sizes: MaxPool(3) → MaxPool(4) → MaxPool(4)
+#  For seq_len=512:  512 → 170 → 42 → 10  (approximate after padding)
 # ─────────────────────────────────────────────────────────────────────────────
-class CNNCancerClassifier(nn.Module):
-    def __init__(self, vocab_size: int = 7, embed_dim: int = 128, num_classes: int = 2):
+ARCH_CONFIGS = {
+    # (embed_dim, conv_filters, fc_units, pool_sizes)
+    "basset":  (64,  (300, 200, 200), (1000, 1000), (3, 4, 4)),  # original Basset scale ~4.1M
+    "matched": (64,  (128, 128, 128), ( 512,  512), (3, 4, 4)),  # param-matched to Mamba ~3.5M
+}
+
+
+class BassetCNN(nn.Module):
+    def __init__(self, vocab_size: int, embed_dim: int,
+                 conv_filters: tuple, fc_units: tuple,
+                 pool_sizes: tuple, seq_len: int = 512, num_classes: int = 2,
+                 dropout: float = 0.3):
         super().__init__()
+        C1, C2, C3 = conv_filters
+        F1, F2     = fc_units
+        P1, P2, P3 = pool_sizes
+
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
-        self.conv = nn.Sequential(
-            nn.Conv1d(embed_dim, 256, kernel_size=8, padding=4), nn.BatchNorm1d(256),
-            nn.ReLU(), nn.MaxPool1d(2),
-            nn.Conv1d(256, 512, kernel_size=8, padding=4), nn.BatchNorm1d(512),
-            nn.ReLU(), nn.MaxPool1d(2),
-            nn.Conv1d(512, 512, kernel_size=8, padding=4), nn.BatchNorm1d(512),
-            nn.ReLU(), nn.MaxPool1d(2),
-            nn.Conv1d(512, 256, kernel_size=4, padding=2), nn.BatchNorm1d(256),
-            nn.ReLU(),
+
+        self.conv_block = nn.Sequential(
+            nn.Conv1d(embed_dim, C1, kernel_size=19, padding=9),
+            nn.BatchNorm1d(C1), nn.ReLU(), nn.MaxPool1d(P1),
+
+            nn.Conv1d(C1, C2, kernel_size=11, padding=5),
+            nn.BatchNorm1d(C2), nn.ReLU(), nn.MaxPool1d(P2),
+
+            nn.Conv1d(C2, C3, kernel_size=7, padding=3),
+            nn.BatchNorm1d(C3), nn.ReLU(), nn.MaxPool1d(P3),
         )
-        self.head = nn.Sequential(
-            nn.Dropout(0.3),
-            nn.Linear(256, 128), nn.ReLU(),
-            nn.Linear(128, num_classes),
+
+        # Compute flattened size after conv+pool
+        with torch.no_grad():
+            dummy = torch.zeros(1, seq_len, dtype=torch.long)
+            emb   = self.embedding(dummy).permute(0, 2, 1)
+            flat  = self.conv_block(emb).flatten(1).shape[1]
+
+        self.fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(flat, F1), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(F1,  F2),  nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(F2, num_classes),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.embedding(x).permute(0, 2, 1)  # (B, E, L)
-        x = self.conv(x)                          # (B, 256, L')
-        x = x.mean(dim=-1)                        # global average pool
-        return self.head(x)
+        x = self.embedding(x).permute(0, 2, 1)   # (B, E, L)
+        x = self.conv_block(x)                     # (B, C3, L')
+        return self.fc(x)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  METRICS
+#  METRICS  (identical to train.py)
 # ─────────────────────────────────────────────────────────────────────────────
 def compute_metrics(preds: torch.Tensor, labels: torch.Tensor) -> dict:
     tp = ((preds == 1) & (labels == 1)).sum().item()
@@ -133,20 +154,16 @@ def compute_auc(logits: torch.Tensor, labels: torch.Tensor) -> float:
     return float(roc_auc_score(labels_np, probs))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  EVALUATION
-# ─────────────────────────────────────────────────────────────────────────────
 def evaluate(model, loader, device, loss_fn=None):
     model.eval()
     logits_all, labels_all = [], []
     loss_sum, n_batches = 0.0, 0
     with torch.no_grad():
         for ids, labels in loader:
-            ids        = ids.to(device)
-            labels_dev = labels.to(device)
-            logits     = model(ids)
+            ids    = ids.to(device)
+            logits = model(ids)
             if loss_fn is not None:
-                loss_sum  += loss_fn(logits, labels_dev).item()
+                loss_sum  += loss_fn(logits, labels.to(device)).item()
                 n_batches += 1
             logits_all.append(logits.cpu())
             labels_all.append(labels)
@@ -159,13 +176,11 @@ def evaluate(model, loader, device, loss_fn=None):
 # ─────────────────────────────────────────────────────────────────────────────
 #  CHECKPOINT
 # ─────────────────────────────────────────────────────────────────────────────
-def save_checkpoint(path, step, model, optimizer, scheduler):
-    torch.save({
-        "step": step,
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "scheduler": scheduler.state_dict(),
-    }, path)
+def save_checkpoint(path, step, model, optimizer, scheduler, arch: str):
+    torch.save({"step": step, "arch": arch,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict()}, path)
     print(f"  [saved] {path}")
 
 
@@ -181,11 +196,13 @@ def load_checkpoint(path, model, optimizer, scheduler, device):
 #  CLI
 # ─────────────────────────────────────────────────────────────────────────────
 def parse_args():
-    p = argparse.ArgumentParser(description="1-D CNN Cancer Gene Baseline")
-    p.add_argument("--splits_dir", type=str,
+    p = argparse.ArgumentParser(description="Basset CNN Baseline")
+    p.add_argument("--arch",         type=str,   default="basset",
+                   choices=["basset", "matched"],
+                   help="basset=original scale (~4.1M), matched=param-matched to Mamba (~3.5M)")
+    p.add_argument("--splits_dir",   type=str,
                    default="/content/drive/MyDrive/Mamba-DNA-1/dataset/splits")
     p.add_argument("--seq_len",      type=int,   default=512)
-    p.add_argument("--embed_dim",    type=int,   default=128)
     p.add_argument("--num_classes",  type=int,   default=2)
     p.add_argument("--batch_size",   type=int,   default=32)
     p.add_argument("--lr",           type=float, default=1e-3)
@@ -209,8 +226,10 @@ def main():
     args   = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    embed_dim, conv_filters, fc_units, pool_sizes = ARCH_CONFIGS[args.arch]
+
     print("=" * 60)
-    print("  1-D CNN Cancer Gene Baseline (chromosome-disjoint splits)")
+    print(f"  Basset CNN ({args.arch}) — chromosome-disjoint splits")
     print(f"  Device  : {device}")
     if device.type == "cuda":
         print(f"  GPU     : {torch.cuda.get_device_name(0)}")
@@ -223,9 +242,9 @@ def main():
     train_csv = os.path.join(args.splits_dir, "train.csv")
     val_csv   = os.path.join(args.splits_dir, "val.csv")
     test_csv  = os.path.join(args.splits_dir, "test.csv")
-    for p in (train_csv, val_csv, test_csv):
-        if not os.path.exists(p):
-            raise FileNotFoundError(f"Missing split file: {p}")
+    for path in (train_csv, val_csv, test_csv):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Missing split file: {path}")
 
     train_ds = CancerGeneDataset(train_csv, tokenizer, args.seq_len)
     val_ds   = CancerGeneDataset(val_csv,   tokenizer, args.seq_len)
@@ -239,22 +258,30 @@ def main():
                               shuffle=False, drop_last=False, num_workers=2)
 
     # ── Model ─────────────────────────────────────────────────────────────────
-    print("\nBuilding CNN model...")
-    model   = CNNCancerClassifier(tokenizer.vocab_size, args.embed_dim, args.num_classes).to(device)
+    print(f"\nBuilding Basset-{args.arch} model...")
+    model = BassetCNN(
+        vocab_size   = tokenizer.vocab_size,
+        embed_dim    = embed_dim,
+        conv_filters = conv_filters,
+        fc_units     = fc_units,
+        pool_sizes   = pool_sizes,
+        seq_len      = args.seq_len,
+        num_classes  = args.num_classes,
+    ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"  Parameters : {n_params/1e6:.2f}M")
-    print(f"  Architecture: Embed({tokenizer.vocab_size},{args.embed_dim}) → "
-          f"4×Conv1d → GlobalAvgPool → MLP")
+    print(f"  Parameters   : {n_params/1e6:.2f}M")
+    print(f"  Conv filters : {conv_filters}  (k=19, k=11, k=7)")
+    print(f"  FC units     : {fc_units}")
+    print(f"  Pool sizes   : {pool_sizes}")
 
-    # ── Optimizer ─────────────────────────────────────────────────────────────
+    # ── Optimizer + cosine LR schedule ───────────────────────────────────────
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
                                   weight_decay=args.weight_decay)
-    # Cosine decay with linear warmup (manual)
     def lr_lambda(step):
         if step < args.warmup_steps:
             return step / max(1, args.warmup_steps)
         progress = (step - args.warmup_steps) / max(1, args.max_steps - args.warmup_steps)
-        return max(0.0, 0.5 * (1.0 + __import__("math").cos(__import__("math").pi * progress)))
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     scaler    = torch.amp.GradScaler("cuda")
@@ -303,36 +330,32 @@ def main():
             all_labels_buf.append(labels.detach().cpu())
             global_step += 1
 
-            # ── Log ───────────────────────────────────────────────────────────
             if global_step % args.log_every == 0:
                 avg_loss = running_loss / args.log_every
                 m = compute_metrics(torch.cat(all_preds), torch.cat(all_labels_buf))
-                lr_now = scheduler.get_last_lr()[0]
                 print(f"step {global_step:>5} | loss {avg_loss:.4f} | "
                       f"acc {m['acc']:.3f} | f1 {m['f1']:.3f} | "
                       f"prec {m['precision']:.3f} | rec {m['recall']:.3f} | "
-                      f"lr {lr_now:.1e} | {time.time()-t0:.0f}s")
+                      f"lr {scheduler.get_last_lr()[0]:.1e} | {time.time()-t0:.0f}s")
                 running_loss = 0.0
                 all_preds, all_labels_buf = [], []
                 t0 = time.time()
 
-            # ── Validation ────────────────────────────────────────────────────
             if global_step % args.save_every == 0:
                 v_logits, v_labels, v_loss = evaluate(model, val_loader, device, loss_fn)
                 v_auc   = compute_auc(v_logits, v_labels)
-                v_preds = v_logits.argmax(-1)
-                vm      = compute_metrics(v_preds, v_labels)
+                vm      = compute_metrics(v_logits.argmax(-1), v_labels)
                 print(f"\n  [VAL] loss {v_loss:.4f} | auc {v_auc:.4f} | "
                       f"acc {vm['acc']:.3f} | f1 {vm['f1']:.3f} | "
                       f"prec {vm['precision']:.3f} | rec {vm['recall']:.3f}")
 
                 save_checkpoint(f"{args.save_dir}/step_{global_step}.pt",
-                                global_step, model, optimizer, scheduler)
+                                global_step, model, optimizer, scheduler, args.arch)
 
                 if v_auc > best_val_auc:
                     best_val_auc = v_auc
                     save_checkpoint(f"{args.save_dir}/best_val.pt",
-                                    global_step, model, optimizer, scheduler)
+                                    global_step, model, optimizer, scheduler, args.arch)
                     print(f"  [BEST VAL AUC] {v_auc:.4f} at step {global_step}\n")
                 else:
                     print()
@@ -342,13 +365,13 @@ def main():
         if global_step >= args.max_steps:
             break
 
-    # ── Final save ────────────────────────────────────────────────────────────
-    save_checkpoint(f"{args.save_dir}/final.pt", global_step, model, optimizer, scheduler)
+    save_checkpoint(f"{args.save_dir}/final.pt",
+                    global_step, model, optimizer, scheduler, args.arch)
     print("\nTraining complete.")
 
     # ── Final test evaluation ─────────────────────────────────────────────────
     print("\n" + "=" * 60)
-    print("  FINAL TEST EVALUATION — CNN (chr19 + chr22, held out)")
+    print(f"  FINAL TEST EVALUATION — Basset-{args.arch} (chr19 + chr22)")
     print("=" * 60)
 
     best_path = f"{args.save_dir}/best_val.pt"
@@ -360,18 +383,16 @@ def main():
 
     t_logits, t_labels, _ = evaluate(model, test_loader, device)
     test_auc   = compute_auc(t_logits, t_labels)
-    test_preds = t_logits.argmax(-1)
-    tm         = compute_metrics(test_preds, t_labels)
+    tm         = compute_metrics(t_logits.argmax(-1), t_labels)
 
     print(f"\n  Overall test AUC : {test_auc:.4f}")
     print(f"  Acc  : {tm['acc']:.4f}   F1   : {tm['f1']:.4f}")
     print(f"  Prec : {tm['precision']:.4f}   Rec  : {tm['recall']:.4f}")
 
-    # Per-chromosome breakdown
     print("\n  Per-chromosome test AUC:")
     test_chroms_list = []
     with open(test_csv, newline="") as f:
-        reader = csv.DictReader(f)
+        reader    = csv.DictReader(f)
         chrom_col = "chromosome" if "chromosome" in reader.fieldnames else "chrom"
         for row in reader:
             test_chroms_list.append(row[chrom_col])
@@ -385,7 +406,7 @@ def main():
         mask = test_chroms_arr == chrom
         if mask.sum() > 20 and len(set(test_labels_arr[mask].tolist())) > 1:
             chrom_auc = roc_auc_score(test_labels_arr[mask], test_probs_arr[mask])
-            cf = test_labels_arr[mask].mean()
+            cf        = test_labels_arr[mask].mean()
             per_chrom[chrom] = {"auc": round(chrom_auc, 4),
                                 "n": int(mask.sum()), "cancer_frac": round(float(cf), 3)}
             print(f"    {chrom}: AUC={chrom_auc:.4f}  n={int(mask.sum()):>6,}  "
@@ -395,7 +416,8 @@ def main():
 
     # ── Save results JSON ─────────────────────────────────────────────────────
     results = {
-        "model": f"1D-CNN, embed_dim={args.embed_dim}, ~{n_params/1e6:.2f}M params",
+        "model": f"Basset-{args.arch}, {n_params/1e6:.2f}M params",
+        "arch": args.arch,
         "training_setup": {
             "split": "chromosome-disjoint: train/val/test",
             "test_chroms": ["chr19", "chr22"],
