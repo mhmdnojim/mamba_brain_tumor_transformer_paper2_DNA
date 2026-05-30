@@ -442,7 +442,7 @@ def main():
 
     # ── Final test evaluation on held-out chromosomes ─────────────────────────
     print("\n" + "=" * 60)
-    print("  FINAL TEST EVALUATION (chr20 + chr22, held out)")
+    print("  FINAL TEST EVALUATION (chr19 + chr22, held out)")
     print("=" * 60)
 
     best_path = f"{args.save_dir}/best_val.pt"
