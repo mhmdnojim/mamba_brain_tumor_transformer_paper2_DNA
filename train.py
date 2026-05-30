@@ -178,7 +178,7 @@ def save_checkpoint(path, step, model, optimizer, scheduler, config):
 
 
 def load_checkpoint(path, model, optimizer, scheduler, device):
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     scheduler.load_state_dict(ckpt["scheduler"])
@@ -447,7 +447,7 @@ def main():
 
     best_path = f"{args.save_dir}/best_val.pt"
     if os.path.exists(best_path):
-        ckpt = torch.load(best_path, map_location=device)
+        ckpt = torch.load(best_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
         print(f"  Loaded best_val.pt from step {ckpt['step']} "
               f"(val_auc={best_val_auc[0]:.4f})")
