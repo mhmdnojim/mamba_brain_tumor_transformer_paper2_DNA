@@ -10,7 +10,7 @@ Reads (--gc_matched mode):
   sequences/normals_windows_gcmatched.jsonl.gz
 
 Writes:
-  cancer_genes.csv  —  columns: sequence, label
+  cancer_genes.csv  —  columns: sequence, chromosome, start, label
 
 Usage:
   python 05_build_csv.py                          # writes ./cancer_genes.csv
@@ -67,7 +67,7 @@ def main(out_csv: str = "cancer_genes.csv", gc_matched: bool = False,
 
     print(f"Reading from: {[f.name for f in jsonl_files]}", flush=True)
 
-    rows: list[tuple[str, int]] = []
+    rows: list[tuple[str, str, int, int]] = []
     n_cancer = n_normal = 0
 
     for jf in jsonl_files:
@@ -75,8 +75,12 @@ def main(out_csv: str = "cancer_genes.csv", gc_matched: bool = False,
             for line in f:
                 try:
                     rec = json.loads(line)
-                    rows.append((rec["seq"], int(rec["label"])))
-                    if rec["label"] == 1:
+                    seq   = rec["seq"]
+                    chrom = rec.get("chromosome") or rec.get("chrom", "")
+                    start = int(rec.get("start", -1))
+                    label = int(rec["label"])
+                    rows.append((seq, chrom, start, label))
+                    if label == 1:
                         n_cancer += 1
                     else:
                         n_normal += 1
@@ -98,7 +102,7 @@ def main(out_csv: str = "cancer_genes.csv", gc_matched: bool = False,
 
     with open(out_path, "w", newline="") as csvf:
         writer = csv.writer(csvf)
-        writer.writerow(["sequence", "label"])
+        writer.writerow(["sequence", "chromosome", "start", "label"])
         writer.writerows(rows)
 
     size_mb = out_path.stat().st_size / 1e6
