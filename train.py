@@ -28,6 +28,7 @@ import math
 import time
 import argparse
 import csv
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -35,6 +36,12 @@ from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import GradScaler, autocast
 
 from transformers import get_cosine_schedule_with_warmup
+
+try:
+    from sklearn.metrics import roc_auc_score as _roc_auc
+    _HAS_SKLEARN = True
+except ImportError:
+    _HAS_SKLEARN = False
 
 # ── Project files (existing in this repo) ────────────────────────────────────
 from mamba_ssm.models.config_mamba import MambaConfig
@@ -153,7 +160,8 @@ class MambaCancerClassifier(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 #  METRICS
 # ─────────────────────────────────────────────────────────────────────────────
-def compute_metrics(preds: torch.Tensor, labels: torch.Tensor):
+def compute_metrics(preds: torch.Tensor, labels: torch.Tensor,
+                    probs: torch.Tensor | None = None):
     tp = ((preds == 1) & (labels == 1)).sum().item()
     fp = ((preds == 1) & (labels == 0)).sum().item()
     fn = ((preds == 0) & (labels == 1)).sum().item()
@@ -163,7 +171,13 @@ def compute_metrics(preds: torch.Tensor, labels: torch.Tensor):
     precision = tp / (tp + fp + 1e-8)
     recall    = tp / (tp + fn + 1e-8)
     f1        = 2 * precision * recall / (precision + recall + 1e-8)
-    return {"acc": acc, "precision": precision, "recall": recall, "f1": f1}
+    result    = {"acc": acc, "precision": precision, "recall": recall, "f1": f1}
+    if probs is not None and _HAS_SKLEARN:
+        try:
+            result["auc"] = _roc_auc(labels.numpy(), probs.numpy())
+        except Exception:
+            pass
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -215,10 +229,13 @@ def parse_args():
     p = argparse.ArgumentParser(description="Mamba Cancer Gene Classifier")
 
     # Data
-    p.add_argument("--data",       type=str, default="cancer_genes.csv",
-                   help="CSV file with columns: sequence, label")
+    p.add_argument("--data",       type=str, default="dataset/cancer_genes_matched.csv",
+                   help="CSV file with columns: sequence, label (used when no splits_dir)")
+    p.add_argument("--splits_dir", type=str, default=None,
+                   help="Directory with train.csv/val.csv/test.csv (chromosome-level split). "
+                        "Auto-detected at dataset/splits/ if present.")
     p.add_argument("--val_split",  type=float, default=0.1,
-                   help="Fraction of data used for validation")
+                   help="Fraction of data used for validation (random split fallback only)")
     p.add_argument("--seq_len",    type=int, default=512,
                    help="Max DNA sequence length in characters")
     p.add_argument("--num_classes",type=int, default=2,
@@ -294,31 +311,38 @@ def main():
     print(f"  seq_len : {args.seq_len}   classes : {args.num_classes}")
     print("=" * 60)
 
-    # ── Auto-build dataset if CSV missing (calls dataset.py) ─────────────────
-    ensure_data(args.data, args.seq_len)
-
     # ── DNA tokenizer (character-level A/T/G/C) ───────────────────────────────
     tokenizer = DNATokenizer()
     print(f"DNA vocabulary size: {tokenizer.vocab_size}")
 
-    # ── Dataset ───────────────────────────────────────────────────────────────
-    print(f"\nLoading data from: {args.data}")
-    full_dataset = CancerGeneDataset(args.data, tokenizer, args.seq_len)
+    # ── Dataset — chromosome split preferred, random split as fallback ────────
+    _splits = Path(args.splits_dir) if args.splits_dir else Path("dataset/splits")
+    te_ds   = None
 
-    val_size   = max(1, int(len(full_dataset) * args.val_split))
-    train_size = len(full_dataset) - val_size
-    train_ds, val_ds = torch.utils.data.random_split(
-        full_dataset, [train_size, val_size],
-        generator=torch.Generator().manual_seed(42)
-    )
+    if (_splits / "train.csv").exists():
+        print(f"\nChromosome-level split from {_splits}/")
+        tr_ds  = CancerGeneDataset(str(_splits / "train.csv"), tokenizer, args.seq_len)
+        val_ds = CancerGeneDataset(str(_splits / "val.csv"),   tokenizer, args.seq_len)
+        te_ds  = CancerGeneDataset(str(_splits / "test.csv"),  tokenizer, args.seq_len)
+        print(f"  Test  : {len(te_ds)} samples (held out until final eval)")
+    else:
+        print(f"\nWARNING: {_splits}/ not found — falling back to random split.")
+        print("  Run Cell 5f in the notebook to build chromosome-level splits.")
+        ensure_data(args.data, args.seq_len)
+        full_dataset = CancerGeneDataset(args.data, tokenizer, args.seq_len)
+        val_size   = max(1, int(len(full_dataset) * args.val_split))
+        train_size = len(full_dataset) - val_size
+        tr_ds, val_ds = torch.utils.data.random_split(
+            full_dataset, [train_size, val_size],
+            generator=torch.Generator().manual_seed(42))
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+    train_loader = DataLoader(tr_ds,  batch_size=args.batch_size,
                               shuffle=True,  drop_last=True,  num_workers=2)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
+    val_loader   = DataLoader(val_ds, batch_size=args.batch_size,
                               shuffle=False, drop_last=False, num_workers=2)
 
-    print(f"  Train : {train_size} samples  ({len(train_loader)} steps/epoch)")
-    print(f"  Val   : {val_size}   samples")
+    print(f"  Train : {len(tr_ds):,} samples  ({len(train_loader)} steps/epoch)")
+    print(f"  Val   : {len(val_ds):,} samples")
 
     # ── Model ─────────────────────────────────────────────────────────────────
     print("\nBuilding model...")
@@ -424,7 +448,7 @@ def main():
             # ── Validation ────────────────────────────────────────────────────
             if global_step % args.save_every == 0:
                 model.eval()
-                val_preds, val_labels = [], []
+                val_preds, val_labels, val_probs = [], [], []
                 val_loss = 0.0
 
                 with torch.no_grad():
@@ -433,14 +457,18 @@ def main():
                         v_labels = v_labels.to(device)
                         v_logits = model(v_ids)
                         val_loss += loss_fn(v_logits, v_labels).item()
+                        val_probs.append(torch.softmax(v_logits, dim=-1)[:, 1].cpu())
                         val_preds.append(v_logits.argmax(-1).cpu())
                         val_labels.append(v_labels.cpu())
 
                 val_preds  = torch.cat(val_preds)
                 val_labels = torch.cat(val_labels)
-                vm = compute_metrics(val_preds, val_labels)
+                val_probs  = torch.cat(val_probs)
+                vm = compute_metrics(val_preds, val_labels, probs=val_probs)
+                auc_str = f"auc {vm['auc']:.4f} | " if "auc" in vm else ""
                 print(
                     f"\n  [VAL] loss {val_loss/len(val_loader):.4f} | "
+                    f"{auc_str}"
                     f"acc {vm['acc']:.3f} | f1 {vm['f1']:.3f} | "
                     f"prec {vm['precision']:.3f} | rec {vm['recall']:.3f}\n"
                 )
@@ -468,6 +496,33 @@ def main():
         config    = config,
     )
     print("\nTraining complete.")
+
+    # ── Final test evaluation (chromosome-held-out set) ───────────────────────
+    if te_ds is not None:
+        print("\n" + "=" * 60)
+        print("  FINAL TEST SET EVALUATION  (chromosome-held-out)")
+        print("=" * 60)
+        te_loader = DataLoader(te_ds, batch_size=args.batch_size,
+                               shuffle=False, drop_last=False, num_workers=2)
+        model.eval()
+        te_preds, te_labels, te_probs = [], [], []
+        with torch.no_grad():
+            for t_ids, t_labels in te_loader:
+                t_ids, t_labels = t_ids.to(device), t_labels.to(device)
+                t_logits = model(t_ids)
+                te_probs.append(torch.softmax(t_logits, dim=-1)[:, 1].cpu())
+                te_preds.append(t_logits.argmax(-1).cpu())
+                te_labels.append(t_labels.cpu())
+        te_preds  = torch.cat(te_preds)
+        te_labels = torch.cat(te_labels)
+        te_probs  = torch.cat(te_probs)
+        tm = compute_metrics(te_preds, te_labels, probs=te_probs)
+        print(f"  AUC       : {tm.get('auc', float('nan')):.4f}")
+        print(f"  Accuracy  : {tm['acc']:.4f}")
+        print(f"  F1        : {tm['f1']:.4f}")
+        print(f"  Precision : {tm['precision']:.4f}")
+        print(f"  Recall    : {tm['recall']:.4f}")
+        print("=" * 60)
 
     # ── Inference example ─────────────────────────────────────────────────────
     print("\nInference example:")
