@@ -259,7 +259,7 @@ def parse_args():
         description="HyenaDNA baseline (from-scratch) for cancer DNA classification")
 
     p.add_argument("--hyena_dir",    type=str,
-                   default="/content/work/hyena-dna",
+                   default="/content/work/hyena-dna-lib",
                    help="Path to cloned HazyResearch/hyena-dna repo")
 
     # Data
