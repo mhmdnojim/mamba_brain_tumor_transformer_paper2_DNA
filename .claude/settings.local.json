@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(git commit *)",
+      "Bash(python -)",
+      "Bash(python -c ' *)",
+      "Bash(python _fix_notebook.py)",
+      "Bash(del _fix_notebook.py)",
+      "Bash(dir \"E:\\\\d\\\\csu\\\\papers\\\\DNA\\\\Project1DNA\\\\paper technics\\\\paper-1-dna-mamba\\\\mamba-main-thier-project\\\\mamba-main\\\\sequences\")",
+      "Bash(python _patch_nb.py)",
+      "Bash(python patch_notebook.py)",
+      "Bash(git rm *)",
+      "Bash(del patch_notebook.py)"
+    ]
+  }
+}
